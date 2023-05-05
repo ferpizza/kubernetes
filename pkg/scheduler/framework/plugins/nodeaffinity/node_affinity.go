@@ -41,6 +41,7 @@ type NodeAffinity struct {
 
 var _ framework.PreFilterPlugin = &NodeAffinity{}
 var _ framework.FilterPlugin = &NodeAffinity{}
+var _ framework.PostFilterPlugin = &NodeAffinity{}
 var _ framework.PreScorePlugin = &NodeAffinity{}
 var _ framework.ScorePlugin = &NodeAffinity{}
 var _ framework.EnqueueExtensions = &NodeAffinity{}
@@ -170,6 +171,66 @@ func (pl *NodeAffinity) Filter(ctx context.Context, state *framework.CycleState,
 	}
 
 	return nil
+}
+
+// PostFilter checks if the Node matches the Pod .spec.affinity.nodeAffinity and
+// the plugin's added affinity.
+func (pl *NodeAffinity) PostFilter(ctx context.Context, cs *framework.CycleState, pod *v1.Pod, filteredNodeStatusMap framework.NodeToStatusMap) (*framework.PostFilterResult, *framework.Status) {
+	affinity := pod.Spec.Affinity
+	noNodeAffinity := (affinity == nil ||
+		affinity.NodeAffinity == nil ||
+		affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution == nil)
+	if noNodeAffinity && pl.addedNodeSelector == nil && pod.Spec.NodeSelector == nil {
+		// NodeAffinity Filter has nothing to do with the Pod.
+		return nil, framework.NewStatus(framework.Skip)
+	}
+
+	state := &preFilterState{requiredNodeSelectorAndAffinity: nodeaffinity.GetRequiredNodeAffinity(pod)}
+	cs.Write(preFilterStateKey, state)
+
+	if noNodeAffinity || len(affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms) == 0 {
+		return nil, nil
+	}
+
+	// Check if there is affinity to a specific node and return it.
+	terms := affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms
+	var nodeNames sets.Set[string]
+	for _, t := range terms {
+		var termNodeNames sets.Set[string]
+		for _, r := range t.MatchFields {
+			if r.Key == metav1.ObjectNameField && r.Operator == v1.NodeSelectorOpIn {
+				// The requirements represent ANDed constraints, and so we need to
+				// find the intersection of nodes.
+				s := sets.New(r.Values...)
+				if termNodeNames == nil {
+					termNodeNames = s
+				} else {
+					termNodeNames = termNodeNames.Intersection(s)
+				}
+			}
+		}
+		if termNodeNames == nil {
+			// If this term has no node.Name field affinity,
+			// then all nodes are eligible because the terms are ORed.
+			return nil, nil
+		}
+		nodeNames = nodeNames.Union(termNodeNames)
+	}
+
+
+	// If nodeNames is not nil, but length is 0, it means each term have conflicting affinity to node.Name;
+	// therefore, pod will not match any node.
+	if nodeNames != nil && nodeNames.Len() == 0 {
+		return nil, framework.NewStatus(framework.UnschedulableAndUnresolvable, errReasonConflict)
+	} else if nodeNames != nil && nodeNames.Len() > 0 {
+    // If nodeNames is not nil, and has items in it, we need to find the one with higher score and return that
+    // TODO instead of returing a random nodeName, we need to score them and find the highest ranked one
+    selectedNode, state := nodeNames.PopAny()
+    if state {
+  	  return framework.NewPostFilterResultWithNominatedNode(selectedNode), framework.NewStatus(framework.Success)
+	  }
+  }
+	return nil, nil
 }
 
 // preScoreState computed at PreScore and used at Score.
